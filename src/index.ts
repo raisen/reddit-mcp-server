@@ -1,7 +1,7 @@
 import crypto from "crypto"
 import dotenv from "dotenv"
 import { FastMCP } from "fastmcp"
-import { ProxyAgent, setGlobalDispatcher } from "undici"
+import { fetch as undiciFetch, ProxyAgent, setGlobalDispatcher } from "undici"
 import { z } from "zod"
 
 import { getRedditClient, initializeRedditClient } from "./client/reddit-client"
@@ -43,6 +43,10 @@ if (rawProxy !== undefined) {
   const proxyUrl = parseProxyUrl(rawProxy)
   if (proxyUrl !== null) {
     setGlobalDispatcher(new ProxyAgent(proxyUrl))
+    // Node's built-in global `fetch` uses the internal undici, which does
+    // NOT share its global dispatcher with the npm `undici` package. Swap
+    // globalThis.fetch for undici's fetch so the ProxyAgent applies.
+    globalThis.fetch = undiciFetch as unknown as typeof globalThis.fetch
     const masked = proxyUrl.replace(/\/\/[^@]+@/, "//***:***@")
     console.error(`[Setup] Outbound HTTP proxy enabled: ${masked}`)
   } else {
