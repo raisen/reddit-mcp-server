@@ -1,6 +1,7 @@
 import crypto from "crypto"
 import dotenv from "dotenv"
 import { FastMCP } from "fastmcp"
+import { ProxyAgent, setGlobalDispatcher } from "undici"
 import { z } from "zod"
 
 import { getRedditClient, initializeRedditClient } from "./client/reddit-client"
@@ -10,6 +11,44 @@ import { formatPostInfo, formatSubredditInfo, formatUserInfo } from "./utils/for
 
 // Load environment variables
 dotenv.config({ quiet: true })
+
+// ---------------------------------------------------------------------------
+// Outbound HTTP proxy for Reddit API calls.
+//
+// Reddit aggressively IP-rate-limits anonymous/unauthenticated traffic, and
+// Render's shared egress gets caught in that net. Routing Reddit traffic
+// through a residential/datacenter proxy sidesteps the block.
+//
+// Accepts either a standard URL (http://user:pass@host:port) or a
+// colon-separated shorthand (host:port:user:pass) common to providers like
+// Decodo / Smartproxy / Oxylabs. Only `fetch()` calls use the global
+// dispatcher, so this does NOT proxy inbound MCP/OAuth traffic.
+// ---------------------------------------------------------------------------
+function parseProxyUrl(raw: string): string | null {
+  const trimmed = raw.trim()
+  if (trimmed === "") return null
+  if (trimmed.includes("://")) return trimmed
+  const parts = trimmed.split(":")
+  if (parts.length < 2) return null
+  const [host, port, user, ...rest] = parts
+  const password = rest.join(":") // tolerate `:` inside password
+  if (user !== undefined && password !== "") {
+    return `http://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}`
+  }
+  return `http://${host}:${port}`
+}
+
+const rawProxy = process.env.REDDIT_PROXY_URL ?? process.env.HTTP_PROXY ?? process.env.HTTPS_PROXY
+if (rawProxy !== undefined) {
+  const proxyUrl = parseProxyUrl(rawProxy)
+  if (proxyUrl !== null) {
+    setGlobalDispatcher(new ProxyAgent(proxyUrl))
+    const masked = proxyUrl.replace(/\/\/[^@]+@/, "//***:***@")
+    console.error(`[Setup] Outbound HTTP proxy enabled: ${masked}`)
+  } else {
+    console.error(`[Setup] REDDIT_PROXY_URL set but could not be parsed, ignoring.`)
+  }
+}
 
 // Version injected at build time by tsdown
 declare const __VERSION__: string
