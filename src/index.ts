@@ -49,6 +49,19 @@ if (rawProxy !== undefined) {
     globalThis.fetch = undiciFetch as unknown as typeof globalThis.fetch
     const masked = proxyUrl.replace(/\/\/[^@]+@/, "//***:***@")
     console.error(`[Setup] Outbound HTTP proxy enabled: ${masked}`)
+    // One-shot egress IP probe so we can see (in logs) whether traffic is
+    // actually traversing the proxy and what exit IP Reddit sees.
+    void (async () => {
+      try {
+        const res = await fetch("https://httpbin.org/ip", {
+          headers: { "User-Agent": "reddit-mcp-server proxy-probe" },
+        })
+        const body = await res.text()
+        console.error(`[Proxy probe] httpbin.org/ip → ${res.status} ${body.slice(0, 200)}`)
+      } catch (err) {
+        console.error(`[Proxy probe] failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    })()
   } else {
     console.error(`[Setup] REDDIT_PROXY_URL set but could not be parsed, ignoring.`)
   }
