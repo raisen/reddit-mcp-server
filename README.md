@@ -328,6 +328,86 @@ docker build -t reddit-mcp-server .
 docker run -d --name reddit-mcp -p 3000:3000 --env-file .env reddit-mcp-server
 ```
 
+## Deploy to Render (Free Tier)
+
+This repo ships a `render.yaml` blueprint that deploys the server as a
+remote MCP endpoint protected by a bearer token.
+
+### One-time deploy via render-cli
+
+```bash
+# Install the Render CLI
+curl -fsSL https://raw.githubusercontent.com/render-oss/cli/refs/heads/main/bin/install.sh | sh
+
+# Authenticate with an API key
+export RENDER_API_KEY=rnd_xxxxxxxxxxxxxxxxxxxx
+render workspace set <your-workspace-id> --confirm
+
+# Pick/generate a strong bearer token (save it — you'll need it to connect)
+export OAUTH_TOKEN=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+
+# Create the web service (free plan, node runtime, auto-deploys on push)
+render services create \
+  --type web_service \
+  --name reddit-mcp-server \
+  --runtime node \
+  --plan free \
+  --region oregon \
+  --repo https://github.com/<org>/reddit-mcp-server \
+  --branch main \
+  --build-command "corepack enable && pnpm install --frozen-lockfile && pnpm build" \
+  --start-command "node dist/index.js" \
+  --health-check-path /health \
+  --env-var TRANSPORT_TYPE=httpStream \
+  --env-var HOST=0.0.0.0 \
+  --env-var OAUTH_ENABLED=true \
+  --env-var OAUTH_TOKEN=$OAUTH_TOKEN \
+  --env-var REDDIT_AUTH_MODE=anonymous \
+  --env-var REDDIT_SAFE_MODE=standard \
+  --output json
+```
+
+Render will return a service URL like `https://reddit-mcp-server.onrender.com`.
+The MCP endpoint is `/mcp`, protected by `Authorization: Bearer $OAUTH_TOKEN`.
+
+### Connecting Claude Desktop
+
+Claude Desktop's "Custom Connector" UI doesn't accept custom HTTP headers,
+so you can't paste a raw bearer token into it. The standard workaround is
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) — an npx proxy
+that turns the remote HTTP server into a local stdio MCP server and
+injects the `Authorization` header on your behalf.
+
+Add this to `claude_desktop_config.json`
+(`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```json
+{
+  "mcpServers": {
+    "reddit": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://reddit-mcp-server.onrender.com/mcp",
+        "--header",
+        "Authorization:${AUTH_HEADER}"
+      ],
+      "env": {
+        "AUTH_HEADER": "Bearer YOUR_OAUTH_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+> **Windows/spaces gotcha:** Claude Desktop (and Cursor on Windows) mangle
+> spaces inside `args`. Keep `Authorization:${AUTH_HEADER}` with no space
+> after the colon, and put the space inside the env var value as shown.
+
+Restart Claude Desktop, and the Reddit tools will appear in the tools menu.
+
 ## Reddit Responsible Builder Policy
 
 This server is designed with [Reddit's Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy) in mind:

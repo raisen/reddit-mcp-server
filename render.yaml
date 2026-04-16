@@ -1,0 +1,32 @@
+# Render Blueprint for Reddit MCP Server
+# Deploys the Reddit MCP server as an HTTP streamable MCP endpoint with
+# bearer-token OAuth protection. Free tier Node web service.
+#
+# After deploy: connect Claude Desktop via `mcp-remote` proxy (see README).
+services:
+  - type: web
+    name: reddit-mcp-server
+    runtime: node
+    plan: free
+    region: oregon
+    repo: https://github.com/raisen/reddit-mcp-server
+    branch: claude/deploy-mcp-render-oauth-sSQOi
+    autoDeploy: true
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    startCommand: node dist/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: TRANSPORT_TYPE
+        value: httpStream
+      - key: HOST
+        value: 0.0.0.0
+      - key: OAUTH_ENABLED
+        value: "true"
+      - key: OAUTH_TOKEN
+        sync: false # Set manually in Render dashboard (or via CLI on create)
+      - key: REDDIT_AUTH_MODE
+        value: anonymous
+      - key: REDDIT_SAFE_MODE
+        value: standard
+      - key: NODE_VERSION
+        value: "22"
