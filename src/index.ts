@@ -49,17 +49,23 @@ if (rawProxy !== undefined) {
     globalThis.fetch = undiciFetch as unknown as typeof globalThis.fetch
     const masked = proxyUrl.replace(/\/\/[^@]+@/, "//***:***@")
     console.error(`[Setup] Outbound HTTP proxy enabled: ${masked}`)
-    // One-shot egress IP probe so we can see (in logs) whether traffic is
-    // actually traversing the proxy and what exit IP Reddit sees.
+    // One-shot egress IP + Reddit reachability probe.
     void (async () => {
       try {
         const res = await fetch("https://httpbin.org/ip", {
           headers: { "User-Agent": "reddit-mcp-server proxy-probe" },
         })
-        const body = await res.text()
-        console.error(`[Proxy probe] httpbin.org/ip → ${res.status} ${body.slice(0, 200)}`)
+        console.error(`[Proxy probe] httpbin.org/ip → ${res.status} ${(await res.text()).slice(0, 200)}`)
       } catch (err) {
-        console.error(`[Proxy probe] failed: ${err instanceof Error ? err.message : String(err)}`)
+        console.error(`[Proxy probe] httpbin failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
+      try {
+        const res = await fetch("https://www.reddit.com/user/raisson/about.json", {
+          headers: { "User-Agent": "typescript:reddit-mcp-server:1.4.4 (by /u/anonymous)" },
+        })
+        console.error(`[Proxy probe] reddit.com → ${res.status} ${(await res.text()).slice(0, 300)}`)
+      } catch (err) {
+        console.error(`[Proxy probe] reddit failed: ${err instanceof Error ? err.message : String(err)}`)
       }
     })()
   } else {
