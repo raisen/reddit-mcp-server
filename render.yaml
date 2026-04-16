@@ -20,13 +20,28 @@ services:
         value: httpStream
       - key: HOST
         value: 0.0.0.0
+      - key: NODE_VERSION
+        value: "22"
+      # ---- Auth (all OAUTH_* values are secrets; set in Render dashboard) ----
       - key: OAUTH_ENABLED
         value: "true"
+      # Pre-shared static bearer token (CLI / curl / mcp-remote users).
+      # Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
       - key: OAUTH_TOKEN
-        sync: false # Set manually in Render dashboard (or via CLI on create)
+        sync: false
+      # OAuth 2.1 flow credentials (required for Claude Desktop Custom Connector).
+      # OAUTH_PUBLIC_URL must match the service's onrender.com URL exactly
+      # (no trailing slash) so the issued JWT aud claim matches.
+      - key: OAUTH_CLIENT_ID
+        sync: false
+      - key: OAUTH_CLIENT_SECRET
+        sync: false
+      - key: OAUTH_JWT_SECRET
+        sync: false
+      - key: OAUTH_PUBLIC_URL
+        sync: false
+      # ---- Reddit API ----
       - key: REDDIT_AUTH_MODE
         value: anonymous
       - key: REDDIT_SAFE_MODE
         value: standard
-      - key: NODE_VERSION
-        value: "22"

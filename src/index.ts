@@ -4,6 +4,7 @@ import { FastMCP } from "fastmcp"
 import { z } from "zod"
 
 import { getRedditClient, initializeRedditClient } from "./client/reddit-client"
+import { buildWwwAuthenticateHeader, registerOAuthRoutes, verifyJwt } from "./oauth"
 import type { BotDisclosureConfig, RedditAuthMode, RedditSafeMode, SafeModeConfig } from "./types"
 import { formatPostInfo, formatSubredditInfo, formatUserInfo } from "./utils/formatters"
 
@@ -187,10 +188,46 @@ async function setupRedditClient() {
   }
 }
 
-// OAuth token: generate once at startup, never expose in responses
-const oauthToken = process.env.OAUTH_TOKEN ?? crypto.randomBytes(32).toString("hex")
-if (process.env.OAUTH_ENABLED === "true" && process.env.OAUTH_TOKEN === undefined) {
-  console.error(`[Auth] Generated OAuth token: ${oauthToken}`)
+// ---------------------------------------------------------------------------
+// OAuth / bearer-token configuration for HTTP transport.
+//
+// Two authentication paths, both active when OAUTH_ENABLED=true:
+//   1. OAuth 2.1 authorization_code + PKCE flow (for Claude Desktop's
+//      Custom Connector UI, which accepts only client_id/client_secret).
+//      Issued access tokens are HS256-signed JWTs.
+//   2. Static bearer token in OAUTH_TOKEN (for CLI scripts, `curl`, and
+//      `mcp-remote` users who prefer a pre-shared key). Kept for backward
+//      compatibility.
+// ---------------------------------------------------------------------------
+
+const oauthEnabled = process.env.OAUTH_ENABLED === "true"
+const staticOauthToken = process.env.OAUTH_TOKEN ?? crypto.randomBytes(32).toString("hex")
+if (oauthEnabled && process.env.OAUTH_TOKEN === undefined) {
+  console.error(`[Auth] Generated static OAuth bearer token: ${staticOauthToken}`)
+}
+
+// OAuth 2.1 flow config (only required when using Claude Desktop connector).
+const oauthClientId = process.env.OAUTH_CLIENT_ID ?? ""
+const oauthClientSecret = process.env.OAUTH_CLIENT_SECRET ?? ""
+const oauthPublicUrl = (process.env.OAUTH_PUBLIC_URL ?? "").replace(/\/$/, "")
+const oauthJwtSecret =
+  process.env.OAUTH_JWT_SECRET ?? crypto.createHash("sha256").update(staticOauthToken).digest("hex")
+const oauthFlowEnabled = oauthEnabled && oauthClientId !== "" && oauthClientSecret !== "" && oauthPublicUrl !== ""
+
+if (oauthEnabled && !oauthFlowEnabled) {
+  console.error(
+    "[Auth] OAuth 2.1 flow disabled (set OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_PUBLIC_URL to enable Claude Desktop connector support).",
+  )
+} else if (oauthFlowEnabled) {
+  console.error(`[Auth] OAuth 2.1 flow enabled. Issuer: ${oauthPublicUrl}`)
+}
+
+function tokenMatches(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided)
+  const b = Buffer.from(expected)
+  const ah = crypto.createHash("sha256").update(a).digest()
+  const bh = crypto.createHash("sha256").update(b).digest()
+  return crypto.timingSafeEqual(ah, bh)
 }
 
 // Create FastMCP server
@@ -221,32 +258,51 @@ IMPORTANT - Reddit Responsible Builder Policy compliance:
 For details: https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy`,
 
   // Optional OAuth configuration for HTTP transport
-  ...(process.env.OAUTH_ENABLED === "true" && {
+  ...(oauthEnabled && {
     authenticate: (request: { readonly headers: { readonly authorization?: string } }) => {
       const authHeader = request.headers.authorization
+      const unauthorized = (status: number, message: string): never => {
+        const headers: Record<string, string> = {}
+        if (oauthFlowEnabled) headers["WWW-Authenticate"] = buildWwwAuthenticateHeader(oauthPublicUrl)
+        throw new Response(null, { status, statusText: message, headers })
+      }
+
       if (!authHeader?.startsWith("Bearer ")) {
-        throw new Response(null, {
-          status: 401,
-          statusText: "Missing or invalid Authorization header",
-        })
+        return unauthorized(401, "Missing or invalid Authorization header")
       }
 
       const token = authHeader.slice(7)
-      const tokenBuffer = Buffer.from(token)
-      const expectedBuffer = Buffer.from(oauthToken)
-      const tokenHash = crypto.createHash("sha256").update(tokenBuffer).digest()
-      const expectedHash = crypto.createHash("sha256").update(expectedBuffer).digest()
-      if (!crypto.timingSafeEqual(tokenHash, expectedHash)) {
-        throw new Response(null, {
-          status: 403,
-          statusText: "Invalid token",
-        })
+
+      // Try the OAuth 2.1 JWT path first (Claude Desktop connector).
+      if (oauthFlowEnabled) {
+        const payload = verifyJwt(token, oauthJwtSecret)
+        if (payload !== null && payload.aud === oauthPublicUrl) {
+          return Promise.resolve({ authenticated: true, subject: String(payload.sub ?? "oauth-user") })
+        }
       }
 
-      return Promise.resolve({ authenticated: true })
+      // Fall back to the static shared bearer token (CLI / mcp-remote users).
+      if (tokenMatches(token, staticOauthToken)) {
+        return Promise.resolve({ authenticated: true, subject: "static-token" })
+      }
+
+      return unauthorized(403, "Invalid token")
     },
   }),
 })
+
+// Mount OAuth 2.1 endpoints onto the same HTTP server as /mcp, so Claude
+// Desktop's Custom Connector (which accepts only client_id/client_secret
+// in Advanced Settings — no custom headers) can complete discovery,
+// authorization, and token exchange entirely against this server.
+if (oauthFlowEnabled) {
+  registerOAuthRoutes(server.getApp(), {
+    publicUrl: oauthPublicUrl,
+    clientId: oauthClientId,
+    clientSecret: oauthClientSecret,
+    jwtSecret: oauthJwtSecret,
+  })
+}
 
 // Test tool
 server.addTool({

@@ -270,20 +270,45 @@ TRANSPORT_TYPE=httpStream PORT=3000 node dist/index.js
 
 ### With OAuth Protection
 
+Two auth paths are supported when `OAUTH_ENABLED=true`:
+
+**1. Static bearer token** (CLI / curl / mcp-remote):
+
 ```bash
 export OAUTH_ENABLED=true
-export OAUTH_TOKEN=$(npx reddit-mcp-server --generate-token | tail -1)
+export OAUTH_TOKEN=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+TRANSPORT_TYPE=httpStream node dist/index.js
+
+curl -H "Authorization: Bearer $OAUTH_TOKEN" \
+     -H "Accept: application/json, text/event-stream" \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+     http://localhost:3000/mcp
+```
+
+**2. OAuth 2.1 authorization-code + PKCE** (Claude Desktop Custom Connector):
+
+```bash
+export OAUTH_ENABLED=true
+export OAUTH_CLIENT_ID=$(node -e "console.log(require('crypto').randomBytes(16).toString('hex'))")
+export OAUTH_CLIENT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+export OAUTH_JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+export OAUTH_PUBLIC_URL=https://your-public-domain.example.com
 TRANSPORT_TYPE=httpStream node dist/index.js
 ```
 
-Make authenticated requests:
+Exposed endpoints:
 
-```bash
-curl -H "Authorization: Bearer $OAUTH_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"method":"tools/list","params":{}}' \
-     http://localhost:3000/mcp
-```
+| Endpoint | RFC | Purpose |
+|---|---|---|
+| `GET /.well-known/oauth-protected-resource` | 9728 | Points clients at the auth server |
+| `GET /.well-known/oauth-authorization-server` | 8414 | Advertises `/authorize`, `/token`, `/register`, PKCE=S256 |
+| `GET /authorize` | 6749 | Validates `client_id` + PKCE, auto-approves, redirects with `code` |
+| `POST /token` | 6749 | `authorization_code` + `refresh_token` grants, returns HS256 JWT |
+| `POST /register` | 7591 | Minimal Dynamic Client Registration |
+
+401s on `/mcp` include `WWW-Authenticate: Bearer resource_metadata=…` so
+conformant clients can auto-discover the auth server.
 
 ## Docker
 
@@ -331,7 +356,10 @@ docker run -d --name reddit-mcp -p 3000:3000 --env-file .env reddit-mcp-server
 ## Deploy to Render (Free Tier)
 
 This repo ships a `render.yaml` blueprint that deploys the server as a
-remote MCP endpoint protected by a bearer token.
+remote MCP endpoint protected by **OAuth 2.1** — discoverable via
+`/.well-known/oauth-authorization-server`, with authorization-code + PKCE,
+refresh tokens, and Dynamic Client Registration. This is the shape
+Claude Desktop's **Custom Connector** expects.
 
 ### One-time deploy via render-cli
 
@@ -343,10 +371,17 @@ curl -fsSL https://raw.githubusercontent.com/render-oss/cli/refs/heads/main/bin/
 export RENDER_API_KEY=rnd_xxxxxxxxxxxxxxxxxxxx
 render workspace set <your-workspace-id> --confirm
 
-# Pick/generate a strong bearer token (save it — you'll need it to connect)
-export OAUTH_TOKEN=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+# Generate strong OAuth secrets (SAVE THESE — you'll need them to connect)
+node -e "
+const c = require('crypto');
+console.log('OAUTH_CLIENT_ID='    + c.randomBytes(16).toString('hex'));
+console.log('OAUTH_CLIENT_SECRET='+ c.randomBytes(32).toString('hex'));
+console.log('OAUTH_JWT_SECRET='   + c.randomBytes(32).toString('hex'));
+console.log('OAUTH_TOKEN='        + c.randomBytes(32).toString('hex'));
+"
 
-# Create the web service (free plan, node runtime, auto-deploys on push)
+# Create the web service (free plan, node runtime, auto-deploys on push).
+# OAUTH_PUBLIC_URL must match the final onrender.com URL (no trailing slash).
 render services create \
   --type web_service \
   --name reddit-mcp-server \
@@ -362,25 +397,44 @@ render services create \
   --env-var HOST=0.0.0.0 \
   --env-var OAUTH_ENABLED=true \
   --env-var OAUTH_TOKEN=$OAUTH_TOKEN \
+  --env-var OAUTH_CLIENT_ID=$OAUTH_CLIENT_ID \
+  --env-var OAUTH_CLIENT_SECRET=$OAUTH_CLIENT_SECRET \
+  --env-var OAUTH_JWT_SECRET=$OAUTH_JWT_SECRET \
+  --env-var OAUTH_PUBLIC_URL=https://reddit-mcp-server.onrender.com \
   --env-var REDDIT_AUTH_MODE=anonymous \
   --env-var REDDIT_SAFE_MODE=standard \
   --output json
 ```
 
-Render will return a service URL like `https://reddit-mcp-server.onrender.com`.
-The MCP endpoint is `/mcp`, protected by `Authorization: Bearer $OAUTH_TOKEN`.
+Render returns a service URL like `https://reddit-mcp-server.onrender.com`.
 
-### Connecting Claude Desktop
+### Connecting Claude Desktop (Custom Connector)
 
-Claude Desktop's "Custom Connector" UI doesn't accept custom HTTP headers,
-so you can't paste a raw bearer token into it. The standard workaround is
-[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) — an npx proxy
-that turns the remote HTTP server into a local stdio MCP server and
-injects the `Authorization` header on your behalf.
+Claude Desktop's Custom Connector UI doesn't accept custom HTTP headers —
+it accepts a **Client ID** and **Client Secret** in Advanced Settings and
+drives the full OAuth 2.1 flow itself. This server speaks that flow
+natively, so no `mcp-remote` proxy is needed.
 
-Add this to `claude_desktop_config.json`
-(`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
-`%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+In Claude Desktop:
+
+1. Settings → **Connectors** → **Add custom connector**
+2. **Name:** `Reddit`
+3. **Remote MCP server URL:** `https://reddit-mcp-server.onrender.com/mcp`
+4. **Advanced settings:**
+   - **OAuth Client ID:** the `OAUTH_CLIENT_ID` you generated
+   - **OAuth Client Secret:** the `OAUTH_CLIENT_SECRET` you generated
+5. Click **Add**, then **Connect**. A browser window opens, the server
+   auto-approves (since possession of the client secret is the auth step),
+   and Claude stores an access token. Tools appear in the tools menu.
+
+Anthropic's cloud contacts the server from public IPs for both the OAuth
+handshake and `/mcp` traffic, so the server must be reachable from the
+internet — which the Render free tier provides out of the box.
+
+### Alternative: static bearer + mcp-remote
+
+For CLI use, Claude Code, or clients that pre-date the OAuth support,
+the static `OAUTH_TOKEN` still works via [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
 
 ```json
 {
@@ -388,25 +442,19 @@ Add this to `claude_desktop_config.json`
     "reddit": {
       "command": "npx",
       "args": [
-        "-y",
-        "mcp-remote",
+        "-y", "mcp-remote",
         "https://reddit-mcp-server.onrender.com/mcp",
-        "--header",
-        "Authorization:${AUTH_HEADER}"
+        "--header", "Authorization:${AUTH_HEADER}"
       ],
-      "env": {
-        "AUTH_HEADER": "Bearer YOUR_OAUTH_TOKEN_HERE"
-      }
+      "env": { "AUTH_HEADER": "Bearer YOUR_OAUTH_TOKEN_HERE" }
     }
   }
 }
 ```
 
-> **Windows/spaces gotcha:** Claude Desktop (and Cursor on Windows) mangle
-> spaces inside `args`. Keep `Authorization:${AUTH_HEADER}` with no space
-> after the colon, and put the space inside the env var value as shown.
-
-Restart Claude Desktop, and the Reddit tools will appear in the tools menu.
+> **Windows/spaces gotcha:** Keep `Authorization:${AUTH_HEADER}` with no
+> space after the colon (Claude Desktop on Windows strips the space),
+> and put the space inside the env var value.
 
 ## Reddit Responsible Builder Policy
 
